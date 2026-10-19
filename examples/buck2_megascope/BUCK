@@ -1,0 +1,31 @@
+load("//buck2:pyrex.bzl", "pyrex_check_test", "pyrex_index", "pyrex_merge")
+
+# Per-target .pyrx shards
+pyrex_index(
+    name = "core_shard",
+    srcs = ["core.py"],
+    base_module = "example_pkg",
+)
+
+pyrex_index(
+    name = "api_shard",
+    srcs = ["api.py"],
+    base_module = "example_pkg",
+    deps = [":core_shard"],
+    entry_points = ["example_pkg.api:handle_request"],
+)
+
+# Whole-program merged .pyrx snapshot
+pyrex_merge(
+    name = "app_megascope",
+    deps = [":api_shard"],
+    entry_points = ["example_pkg.api:handle_request"],
+)
+
+# Cross-module static analysis test target (`buck2 test //examples/buck2_megascope:app_check`)
+pyrex_check_test(
+    name = "app_check",
+    index = ":app_megascope",
+    checks = "all",
+    fail_on = "error",
+)

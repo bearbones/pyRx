@@ -1,0 +1,42 @@
+[package]
+name = "pyrx"
+version = "0.1.0"
+edition = "2024"
+description = "pyRx — Whole-Program Call-Graph Indexing, Cross-Module Static Analysis, and Anti-Sprawl Refactoring for Python"
+license = "Apache-2.0"
+authors = ["Alex Mason"]
+repository = "https://github.com/bearbones/pyRx"
+readme = "README.md"
+keywords = ["python", "linter", "static-analysis", "call-graph", "refactoring"]
+categories = ["development-tools", "command-line-utilities"]
+
+[lib]
+name = "pyrx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pyrx"
+path = "src/main.rs"
+
+[dependencies]
+megascope = { version = "0.1.0", git = "https://github.com/bearbones/megascope.git", tag = "v0.1.0" }
+ruff_python_parser = { package = "rustpython-ruff_python_parser", version = "0.16.10" }
+ruff_python_ast = { package = "rustpython-ruff_python_ast", version = "0.16.10" }
+ruff_source_file = { package = "rustpython-ruff_source_file", version = "0.16.10" }
+ruff_text_size = { package = "rustpython-ruff_text_size", version = "0.16.10" }
+rayon = "1.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+toml = "0.8"
+regex = "1.11"
+globset = "0.4"
+walkdir = "2.5"
+similar = "2.6"
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[lints.clippy]
+collapsible_if = "allow"

@@ -1,0 +1,216 @@
+# Copyright (c) 2026 The pyrex Authors
+# Original author: Alex Mason
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Zero-Config BXL scripts for indexing and checking existing Buck2 `python_library`,
+`python_binary`, and `python_test` targets without modifying `BUCK` files.
+
+Usage:
+  buck2 bxl //buck2:pyrex.bxl:index -- --targets //app/...
+  buck2 bxl //buck2:pyrex.bxl:check -- --targets //app/... --format sarif
+"""
+
+def _extract_srcs_from_target(t) -> list:
+    attrs = t.attrs_lazy()
+    srcs_attr = attrs.get("srcs")
+    if srcs_attr == None:
+        return []
+    val = srcs_attr.value()
+    if type(val) == "list":
+        return [s for s in val]
+    if type(val) == "dict":
+        return [s for s in val.values()]
+    return []
+
+def _index_impl(ctx: bxl.Context):
+    bxl_actions = ctx.bxl_actions()
+    actions = bxl_actions.actions
+    pyrex_exe = ctx.cli_args.pyrex_executable
+
+    target_set = ctx.uquery().deps(ctx.cli_args.targets)
+    py_targets = [
+        t
+        for t in target_set
+        if t.rule_type in (
+            "prelude//rules.bzl:python_library",
+            "prelude//rules.bzl:python_binary",
+            "prelude//rules.bzl:python_test",
+            "python_library",
+            "python_binary",
+            "python_test",
+        )
+    ]
+
+    target_shards = []
+    for t in py_targets:
+        srcs = _extract_srcs_from_target(t)
+        if not srcs:
+            continue
+        safe_name = "{}_{}".format(t.label.package.replace("/", "_"), t.label.name)
+        mod_shards = []
+        for idx, src in enumerate(srcs):
+            mod_out = actions.declare_output("bxl_mod/{}/{}.pyrx".format(safe_name, idx))
+            cmd = cmd_args(
+                pyrex_exe,
+                "megascope",
+                "index",
+                "--threads",
+                "1",
+                "--no-wait",
+                "--force",
+                "--source",
+                src,
+                "--index",
+                mod_out.as_output(),
+            )
+            actions.run(cmd, category = "pyrex_bxl_mod_index", identifier = "{}_{}".format(safe_name, idx))
+            mod_shards.append(mod_out)
+
+        if len(mod_shards) == 1:
+            target_shards.append(mod_shards[0])
+        else:
+            tgt_out = actions.declare_output("bxl_target/{}.pyrx".format(safe_name))
+            inp_list = actions.write("bxl_target/{}.inputs.txt".format(safe_name), cmd_args(mod_shards))
+            merge_cmd = cmd_args(
+                pyrex_exe,
+                "megascope",
+                "merge",
+                "--no-wait",
+                "--allow-mismatch",
+                "--output",
+                tgt_out.as_output(),
+                "--input-list",
+                inp_list,
+                hidden = mod_shards,
+            )
+            actions.run(merge_cmd, category = "pyrex_bxl_target_merge", identifier = safe_name)
+            target_shards.append(tgt_out)
+
+    global_out = actions.declare_output(ctx.cli_args.output)
+    global_list = actions.write(ctx.cli_args.output + ".inputs.txt", cmd_args(target_shards))
+    global_cmd = cmd_args(
+        pyrex_exe,
+        "megascope",
+        "merge",
+        "--no-wait",
+        "--allow-mismatch",
+        "--output",
+        global_out.as_output(),
+        "--input-list",
+        global_list,
+        hidden = target_shards,
+    )
+    actions.run(global_cmd, category = "pyrex_bxl_global_merge", identifier = "global")
+    ensured = ctx.output.ensure(global_out)
+    ctx.output.print(ensured.abs_path())
+
+index = bxl_main(
+    impl = _index_impl,
+    cli_args = {
+        "output": cli_args.string(default = "global.pyrx"),
+        "pyrex_executable": cli_args.string(default = "pyrex"),
+        "targets": cli_args.target_expr(),
+    },
+)
+
+def _check_impl(ctx: bxl.Context):
+    bxl_actions = ctx.bxl_actions()
+    actions = bxl_actions.actions
+    pyrex_exe = ctx.cli_args.pyrex_executable
+
+    target_set = ctx.uquery().deps(ctx.cli_args.targets)
+    py_targets = [
+        t
+        for t in target_set
+        if t.rule_type in (
+            "prelude//rules.bzl:python_library",
+            "prelude//rules.bzl:python_binary",
+            "prelude//rules.bzl:python_test",
+            "python_library",
+            "python_binary",
+            "python_test",
+        )
+    ]
+
+    mod_shards = []
+    for t in py_targets:
+        srcs = _extract_srcs_from_target(t)
+        safe_name = "{}_{}".format(t.label.package.replace("/", "_"), t.label.name)
+        for idx, src in enumerate(srcs):
+            mod_out = actions.declare_output("bxl_check_mod/{}/{}.pyrx".format(safe_name, idx))
+            cmd = cmd_args(
+                pyrex_exe,
+                "megascope",
+                "index",
+                "--threads",
+                "1",
+                "--no-wait",
+                "--force",
+                "--source",
+                src,
+                "--index",
+                mod_out.as_output(),
+            )
+            actions.run(cmd, category = "pyrex_bxl_mod_index", identifier = "{}_{}".format(safe_name, idx))
+            mod_shards.append(mod_out)
+
+    global_out = actions.declare_output("bxl_check/global.pyrx")
+    global_list = actions.write("bxl_check/global.inputs.txt", cmd_args(mod_shards))
+    actions.run(
+        cmd_args(
+            pyrex_exe,
+            "megascope",
+            "merge",
+            "--no-wait",
+            "--allow-mismatch",
+            "--output",
+            global_out.as_output(),
+            "--input-list",
+            global_list,
+            hidden = mod_shards,
+        ),
+        category = "pyrex_bxl_global_merge",
+        identifier = "check_global",
+    )
+
+    ext = "sarif" if ctx.cli_args.format == "sarif" else ("json" if ctx.cli_args.format == "json" else "txt")
+    report_out = actions.declare_output("bxl_check/report." + ext)
+    check_cmd = cmd_args(
+        pyrex_exe,
+        "check",
+        "--index",
+        global_out,
+        "--format",
+        ctx.cli_args.format,
+        "--fail-on",
+        ctx.cli_args.fail_on,
+        "--output",
+        report_out.as_output(),
+    )
+    if ctx.cli_args.checks != "":
+        check_cmd.add("--checks", ctx.cli_args.checks)
+    actions.run(check_cmd, category = "pyrex_bxl_check", identifier = "check")
+    ensured = ctx.output.ensure(report_out)
+    ctx.output.print(ensured.abs_path())
+
+check = bxl_main(
+    impl = _check_impl,
+    cli_args = {
+        "checks": cli_args.string(default = ""),
+        "fail_on": cli_args.string(default = "none"),
+        "format": cli_args.string(default = "sarif"),
+        "pyrex_executable": cli_args.string(default = "pyrex"),
+        "targets": cli_args.target_expr(),
+    },
+)

@@ -1,0 +1,11 @@
+/target/
+/.pyrex/
+*.pyrx
+*.pyrx.lock
+*.pyrx.tmp*
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/

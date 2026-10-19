@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pyrx"
+version = "0.1.0"
+description = "pyRx — Whole-Program Call-Graph Indexing, Cross-Module Static Analysis, and Anti-Sprawl Refactoring for Python"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+keywords = ["python", "static-analysis", "call-graph", "refactoring", "codemod", "buck2", "pyrx"]
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "Cargo.toml"
+strip = true
