@@ -6,6 +6,23 @@ While single-file linters (`ruff`) and type checkers (`pyright`, `mypy`) operate
 
 ---
 
+## Install
+
+### Homebrew (macOS arm64 & Linux x86_64)
+
+```bash
+brew tap bearbones/pyrx
+brew install pyrx
+```
+
+### From Source
+
+```bash
+cargo install --path .
+```
+
+---
+
 ## Three Pillars
 
 ### 1. `pyrx megascope` — Whole-Program Graph & Control-Flow Query Engine
