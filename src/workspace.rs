@@ -23,6 +23,7 @@ pub struct SourceModule {
 /// Discovered workspace metadata (`pyproject.toml`, `.pyrx.toml`, `src/` roots, entry points).
 #[derive(Clone, Debug, Default)]
 pub struct WorkspaceConfig {
+    pub framework_entry_points: bool,
     pub project_root: PathBuf,
     pub package_roots: Vec<PathBuf>,
     /// Entry points from `[project.scripts]`, `[project.gui-scripts]`, `.pyrx.toml`, `SKILL.md` scripts, and CLI flags.
@@ -37,6 +38,7 @@ pub struct WorkspaceConfig {
 
 #[derive(Clone, Debug, Default)]
 pub struct SourceSelectionOptions {
+    pub no_cache: bool,
     pub project_root: Option<PathBuf>,
     pub sources: Vec<PathBuf>,
     pub source_list: Option<PathBuf>,
@@ -52,7 +54,14 @@ impl WorkspaceConfig {
         let project_root = find_project_root(start_dir).unwrap_or_else(|| {
             fs::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf())
         });
+        Self::at_root(&project_root)
+    }
+
+    /// Explicit project roots must not inherit a containing repository's package roots.
+    pub fn at_root(root: &Path) -> Self {
+        let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let mut config = WorkspaceConfig {
+            framework_entry_points: true,
             project_root: project_root.clone(),
             package_roots: Vec::new(),
             entry_points: Vec::new(),
@@ -86,6 +95,15 @@ impl WorkspaceConfig {
                 }
             }
         }
+
+        // Prefer the most specific package root before the containing workspace root.
+        config.package_roots.sort_by(|a, b| {
+            b.components()
+                .count()
+                .cmp(&a.components().count())
+                .then_with(|| a.cmp(b))
+        });
+        config.package_roots.dedup();
 
         // Discover SKILL.md scripts (`**/SKILL.md` -> sibling `scripts/*.py`)
         discover_skill_scripts(&project_root, &mut config);
@@ -239,11 +257,7 @@ pub fn select_sources(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let mut ws = if let Some(explicit_root) = &opts.project_root {
-        let mut c = WorkspaceConfig::discover(explicit_root);
-        c.project_root = normalize_lexical(
-            &fs::canonicalize(explicit_root).unwrap_or_else(|_| explicit_root.clone()),
-        );
-        c
+        WorkspaceConfig::at_root(explicit_root)
     } else {
         WorkspaceConfig::discover(&start_dir)
     };
@@ -527,23 +541,80 @@ fn parse_pyproject_toml(content: &str, project_root: &Path, config: &mut Workspa
         for tool_key in ["pyrx", "pyrex"] {
             if let Some(pyrx_tbl) = tool.get(tool_key).and_then(|v| v.as_table()) {
                 extract_toml_entry_points(pyrx_tbl, &mut config.entry_points);
+                if let Some(enabled) = pyrx_tbl
+                    .get("framework_entry_points")
+                    .and_then(|v| v.as_bool())
+                {
+                    config.framework_entry_points = enabled;
+                }
             }
         }
         if let Some(uv) = tool.get("uv").and_then(|v| v.as_table()) {
             if let Some(ws) = uv.get("workspace").and_then(|v| v.as_table()) {
                 if let Some(members) = ws.get("members").and_then(|v| v.as_array()) {
-                    for member in members.iter().filter_map(|m| m.as_str()) {
-                        let member_dir = project_root.join(member);
-                        if member_dir.is_dir() {
-                            let member_src = member_dir.join("src");
-                            if member_src.is_dir() {
-                                config.package_roots.push(member_src);
+                    let matches = |key: &str, relative: &str| {
+                        ws.get(key)
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|patterns| {
+                                patterns.iter().filter_map(|v| v.as_str()).any(|pattern| {
+                                    globset::GlobBuilder::new(pattern.trim_end_matches('/'))
+                                        .literal_separator(true)
+                                        .build()
+                                        .is_ok_and(|glob| glob.compile_matcher().is_match(relative))
+                                })
+                            })
+                    };
+                    if !members.is_empty() {
+                        for entry in WalkDir::new(project_root)
+                            .into_iter()
+                            .filter_entry(|e| !is_ignored_dir(e.file_name().to_str().unwrap_or("")))
+                            .filter_map(Result::ok)
+                        {
+                            if entry.file_name() != "pyproject.toml" || !entry.file_type().is_file()
+                            {
+                                continue;
                             }
-                            config.package_roots.push(member_dir);
+                            let member_dir = entry.path().parent().unwrap();
+                            if member_dir == project_root {
+                                continue;
+                            }
+                            let relative =
+                                path_to_slash(member_dir.strip_prefix(project_root).unwrap());
+                            if matches("members", &relative) && !matches("exclude", &relative) {
+                                let member_src = member_dir.join("src");
+                                if member_src.is_dir() {
+                                    config.package_roots.push(member_src);
+                                }
+                                config.package_roots.push(member_dir.to_path_buf());
+                                if let Ok(content) = fs::read_to_string(entry.path()) {
+                                    if let Ok(member_val) = content.parse::<toml::Value>() {
+                                        collect_project_entry_points(
+                                            &member_val,
+                                            &mut config.entry_points,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+fn collect_project_entry_points(value: &toml::Value, out: &mut Vec<String>) {
+    let Some(project) = value.get("project") else {
+        return;
+    };
+    for section in ["scripts", "gui-scripts"] {
+        if let Some(table) = project.get(section).and_then(|v| v.as_table()) {
+            out.extend(table.values().filter_map(|v| v.as_str()).map(str::to_owned));
+        }
+    }
+    if let Some(groups) = project.get("entry-points").and_then(|v| v.as_table()) {
+        for table in groups.values().filter_map(|v| v.as_table()) {
+            out.extend(table.values().filter_map(|v| v.as_str()).map(str::to_owned));
         }
     }
 }
@@ -554,6 +625,9 @@ fn parse_pyrx_toml_entry_points(content: &str, config: &mut WorkspaceConfig) {
     };
     if let Some(tbl) = val.as_table() {
         extract_toml_entry_points(tbl, &mut config.entry_points);
+        if let Some(enabled) = tbl.get("framework_entry_points").and_then(|v| v.as_bool()) {
+            config.framework_entry_points = enabled;
+        }
     }
 }
 

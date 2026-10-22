@@ -314,7 +314,10 @@ fn test_all_16_checks_fire_accurately() {
         file = first_finding.file,
         line = first_finding.line
     );
-    let diff_report = run_checks(&idx, &cfg, None, Some(&patch));
+    // Explicit legacy line mode retains the original location-only contract.
+    let mut line_cfg = cfg.clone();
+    line_cfg.diff_lines_only = true;
+    let diff_report = run_checks(&idx, &line_cfg, None, Some(&patch));
     assert!(
         !diff_report.findings.is_empty() && diff_report.findings.len() < report.findings.len(),
         "Diff-scoped check run should only retain findings on lines touched by patch"

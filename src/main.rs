@@ -1,12 +1,12 @@
 use pyrx::bake_program_index;
 use pyrx::check::{
     ALL_CHECKS, BaselineFile, FailOnThreshold, ResolvedCheckConfig, build_baseline_file,
-    render_json_report, render_sarif_report, render_text_report, run_checks,
+    render_json_report, render_sarif_report, run_checks,
 };
 use pyrx::diff::compute_semantic_diff;
 use pyrx::graph::ProgramIndex;
 use pyrx::model::*;
-use pyrx::morph::{MorphRulesFile, run_consolidate, run_declarative_rules};
+use pyrx::morph::{MorphRulesFile, run_declarative_rules};
 use pyrx::query::{REGISTERED_TOOLS, execute_tool, find_tool_descriptor, format_tool_output};
 use pyrx::snapshot::{
     load_snapshot, load_snapshot_info, merge_snapshots, resolve_index_path, save_snapshot,
@@ -58,11 +58,11 @@ fn print_top_help() {
          USAGE:\n  \
            pyrx megascope <verb> [options]\n  \
            pyrx check [options]\n  \
-           pyrx morph <consolidate|rewrite> [options]\n\n\
+           pyrx morph rewrite [options]\n\n\
          SUBCOMMANDS:\n  \
            megascope   Whole-program call/import/control-flow index & query engine (.pyrx)\n  \
            check       Cross-module static analysis, reachability, and anti-sprawl checks\n  \
-           morph       Multi-file CST refactoring & duplicate-consolidation codemods",
+           morph       Explicit multi-file CST codemods",
         pyrx::VERSION
     );
 }
@@ -158,6 +158,7 @@ fn run_megascope_index(args: &[String]) -> ExitCode {
         let arg = &args[i];
         let (flag, inline_val) = split_inline_flag(arg);
         match flag {
+            "--no-cache" => sel.no_cache = true,
             "--source" | "-s" => {
                 let Some(val) = next_val(args, &mut i, inline_val) else {
                     eprintln!("error: {flag} requires a path");
@@ -982,6 +983,8 @@ fn run_check_cmd(args: &[String]) -> ExitCode {
     let mut output_file: Option<PathBuf> = None;
     let mut cli_fail_on: Option<FailOnThreshold> = None;
     let mut allow_parse_failures = false;
+    let mut verbosity = 0u8;
+    let mut diff_lines_only = false;
     let mut baseline_path: Option<PathBuf> = None;
     let mut write_baseline_path: Option<PathBuf> = None;
     let mut patch_file: Option<PathBuf> = None;
@@ -1037,6 +1040,7 @@ fn run_check_cmd(args: &[String]) -> ExitCode {
                 };
                 index_path = Some(PathBuf::from(val));
             }
+            "--no-cache" => sel.no_cache = true,
             "--source" | "-s" => {
                 let Some(val) = next_val(args, &mut i, inline_val) else {
                     eprintln!("error: --source requires a path");
@@ -1158,7 +1162,22 @@ fn run_check_cmd(args: &[String]) -> ExitCode {
                 };
                 threads = n;
             }
-            "-v" | "--verbose" => {}
+            "-v" | "--verbose" => verbosity = verbosity.saturating_add(1),
+            "-vv" => verbosity = 2,
+            "--diff-scope" => {
+                let Some(value) = next_val(args, &mut i, inline_val) else {
+                    eprintln!("error: --diff-scope requires impact|lines");
+                    return ExitCode::UsageError;
+                };
+                match value.as_str() {
+                    "impact" => diff_lines_only = false,
+                    "lines" => diff_lines_only = true,
+                    _ => {
+                        eprintln!("error: --diff-scope requires impact|lines");
+                        return ExitCode::UsageError;
+                    }
+                }
+            }
             other if !other.starts_with('-') => {
                 sel.sources.push(PathBuf::from(other));
             }
@@ -1231,6 +1250,8 @@ fn run_check_cmd(args: &[String]) -> ExitCode {
         }
     };
 
+    resolved_cfg.diff_lines_only = diff_lines_only;
+
     for kv in &check_option_kvs {
         if let Err(e) = resolved_cfg.apply_check_option_kv(kv) {
             eprintln!("error: {e}");
@@ -1279,8 +1300,16 @@ fn run_check_cmd(args: &[String]) -> ExitCode {
             }
         }
     } else {
-        match bake_program_index(&sel, Vec::new(), threads) {
-            Ok(idx) => idx,
+        match pyrx::bake_program_index_with_stats(&sel, Vec::new(), threads) {
+            Ok((idx, stats)) => {
+                if verbosity > 0 {
+                    eprintln!(
+                        "index: {} modules reused, {} parsed",
+                        stats.reused, stats.parsed
+                    );
+                }
+                idx
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 return ExitCode::UsageError;
@@ -1304,6 +1333,17 @@ fn run_check_cmd(args: &[String]) -> ExitCode {
         report.summary.suppressed
     );
 
+    if verbosity > 0 {
+        eprintln!(
+            "analysis: {} internal call edges, {} external/unresolved, {} uncertain; {} entry points; no traversal depth cutoff",
+            report.analysis.internal_call_edges,
+            report.analysis.external_or_unresolved_call_edges,
+            report.analysis.uncertain_call_edges,
+            report.analysis.entry_points
+        );
+        eprintln!("{}", report.analysis.limitation);
+    }
+
     if let Some(wb_path) = write_baseline_path {
         if report.summary.failed > 0 && !allow_parse_failures {
             eprintln!("error: refusing to write baseline because module parse(s) failed");
@@ -1321,7 +1361,7 @@ fn run_check_cmd(args: &[String]) -> ExitCode {
     let rendered = match format.as_str() {
         "json" => render_json_report(&report, pretty),
         "sarif" => render_sarif_report(&report),
-        _ => render_text_report(&report),
+        _ => pyrx::check::render_text_report_verbose(&report, verbosity),
     };
 
     if let Some(out_p) = output_file {
@@ -1379,11 +1419,15 @@ fn print_check_help() {
            --check-options <k1=v1,k2=v2>        Set comma-separated per-check options\n  \
            --format text|json|sarif             Output format (default: text)\n  \
            --output <file>                      Write report to file\n  \
-           --fail-on <sev>                      Exit 1 threshold: note|warning|error|none (default: note)\n  \
+           --fail-on <sev>                      Exit 1 threshold: note|warning|error|none (default: warning)\n  \
            --baseline <file>                    Filter findings against a baseline file\n  \
            --write-baseline <file>              Record current findings to a baseline file\n  \
-           --patch-file <file>                  Filter findings to lines changed in unified diff\n  \
-           --git-base <rev>                     Filter findings to lines changed since git revision"
+           --patch-file <file>                  Keep findings affected by a unified diff\n  \
+           --git-base <rev>                     Keep findings affected since a git revision\n  \
+           --diff-scope impact|lines            Patch filter mode (default: impact)\n  \
+           --no-cache                          Parse every source instead of using .pyrx/cache\n  \
+           -v, --verbose                       Explain call sites, coverage, and cache use\n  \
+           -vv                                 Include complete diagnostic paths"
     );
 }
 
@@ -1401,20 +1445,17 @@ fn run_morph_cmd(args: &[String]) -> ExitCode {
         };
     }
 
-    let mut is_consolidate = false;
-    let mut start_idx = 0usize;
     if args[0] == "consolidate" {
-        is_consolidate = true;
-        start_idx = 1;
-    } else if args[0] == "rewrite" {
-        start_idx = 1;
+        eprintln!(
+            "error: automatic consolidation has been removed; use 'pyrx check --checks semantic-clone' for informational similarity diagnostics"
+        );
+        return ExitCode::UsageError;
     }
+    let start_idx = usize::from(args[0] == "rewrite");
 
     let mut sel = SourceSelectionOptions::default();
     let mut index_path: Option<PathBuf> = None;
     let mut rules_json_path: Option<PathBuf> = None;
-    let mut canonical_target: Option<String> = None;
-    let mut duplicates: Vec<String> = Vec::new();
     let mut dry_run = false;
     let mut format = "text".to_string();
     let mut pretty = false;
@@ -1424,23 +1465,6 @@ fn run_morph_cmd(args: &[String]) -> ExitCode {
     while i < args.len() {
         let (flag, inline_val) = split_inline_flag(&args[i]);
         match flag {
-            "--consolidate" | "--all" => is_consolidate = true,
-            "--canonical" | "--symbol" => {
-                is_consolidate = true;
-                let Some(val) = next_val(args, &mut i, inline_val) else {
-                    eprintln!("error: {flag} requires a symbol name");
-                    return ExitCode::UsageError;
-                };
-                canonical_target = Some(val);
-            }
-            "--duplicate" => {
-                is_consolidate = true;
-                let Some(val) = next_val(args, &mut i, inline_val) else {
-                    eprintln!("error: --duplicate requires a symbol name");
-                    return ExitCode::UsageError;
-                };
-                duplicates.push(val);
-            }
             "--rules-json" => {
                 let Some(val) = next_val(args, &mut i, inline_val) else {
                     eprintln!("error: --rules-json requires a file path");
@@ -1455,6 +1479,7 @@ fn run_morph_cmd(args: &[String]) -> ExitCode {
                 };
                 index_path = Some(PathBuf::from(val));
             }
+            "--no-cache" => sel.no_cache = true,
             "--source" | "-s" => {
                 let Some(val) = next_val(args, &mut i, inline_val) else {
                     eprintln!("error: --source requires a path");
@@ -1503,8 +1528,8 @@ fn run_morph_cmd(args: &[String]) -> ExitCode {
         i += 1;
     }
 
-    if !is_consolidate && rules_json_path.is_none() {
-        eprintln!("error: 'pyrx morph' requires either 'consolidate' or '--rules-json <file>'");
+    if rules_json_path.is_none() {
+        eprintln!("error: 'pyrx morph' requires '--rules-json <file>'");
         return ExitCode::UsageError;
     }
 
@@ -1539,15 +1564,7 @@ fn run_morph_cmd(args: &[String]) -> ExitCode {
         }
     });
 
-    let report_res = if is_consolidate {
-        run_consolidate(
-            &prog_index,
-            &project_root,
-            canonical_target.as_deref(),
-            &duplicates,
-            dry_run,
-        )
-    } else {
+    let report_res = {
         let rpath = rules_json_path.unwrap();
         let content = match fs::read_to_string(&rpath) {
             Ok(c) => c,
@@ -1607,16 +1624,12 @@ fn run_morph_cmd(args: &[String]) -> ExitCode {
 
 fn print_morph_help() {
     println!(
-        "pyRx morph — Multi-File CST Refactoring & Duplicate Consolidation\n\n\
-         USAGE:\n  \
-           pyrx morph consolidate [--canonical <symbol>] [--dry-run] [--source <path>...]\n  \
-           pyrx morph [rewrite] --rules-json <file> [--dry-run] [--source <path>...]\n\n\
-         OPTIONS:\n  \
-           --canonical <symbol>   Canonical function to consolidate semantic clones into\n  \
-           --duplicate <symbol>   Specific duplicate function(s) to collapse\n  \
-           --rules-json <file>    Declarative cross-module CST codemod rules JSON\n  \
-           --dry-run              Emit unified diffs without modifying files on disk\n  \
-           --format text|json     Output format (default: text)"
+        "pyRx morph — Explicit Multi-File CST Codemods\n\n\
+        USAGE:\n  pyrx morph rewrite --rules-json <file> [--dry-run] [--source <path>...]\n\n\
+        OPTIONS:\n  --rules-json <file>    Declarative codemod rules JSON\n  \
+        --dry-run              Preview unified diffs without modifying files\n  \
+        --format text|json     Output format (default: text)\n\n\
+        Similarity findings are diagnostic only; automatic consolidation is not supported."
     );
 }
 

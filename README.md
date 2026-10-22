@@ -86,7 +86,7 @@ pyrx check --project . --baseline .pyrx-baseline.json --patch-file pr.diff
 
 #### All 16 Checks Across 5 Categories ([Full Documentation Index](docs/checks/README.md))
 - **Category A — Anti-Sprawl & LLM Consolidation**:
-  - [`semantic-clone`](docs/checks/semantic-clone.md): Functions/methods across modules with identical or near-identical alpha-renamed AST/CFG skeletons (`semantic-clone.min_statements = 5`).
+  - [`semantic-clone`](docs/checks/semantic-clone.md): Informational similarity candidates across modules; matching skeletons do not establish equivalent behavior (`semantic-clone.min_statements = 5`).
   - [`schema-drift`](docs/checks/schema-drift.md): Parallel `@dataclass`, `TypedDict`, `NamedTuple`, or Pydantic `BaseModel` schemas with overlapping or conflicting field types.
   - [`dict-contract-mismatch`](docs/checks/dict-contract-mismatch.md): Cross-module producer dict literal keys vs unguarded consumer `Load` subscript accesses (`KeyError` hazards).
   - [`uncentralized-env-access`](docs/checks/uncentralized-env-access.md) *(legacy alias: `env-sprawl`)*: Scattered `os.environ` / `os.getenv` reads outside configuration modules (`config`, `settings`, `env`, `constants`, `cli`, `__main__`, `conftest`, or `config_modules` in `.pyrx.toml`) or conflicting defaults/casts.
@@ -128,19 +128,26 @@ fail = false  # Report in output/SARIF without causing a nonzero CI exit code
 "semantic-clone.min_statements" = 5
 ```
 
+Notes, including `semantic-clone`, do not fail checks by default (`fail_on = "warning"`). Use `--fail-on note` to opt in. Similarity findings never generate a fix; automatic consolidation has been removed.
+
+Checks follow the indexed graph without a call-depth cutoff. Long diagnostic paths show the first three and last three frames. Use `-v` for call-site evidence and coverage, or `-vv` for full paths. JSON `evidence` and SARIF `codeFlows` retain the complete witness.
+
+`--patch-file` and `--git-base` include affected callers and importers by default. Use `--diff-scope lines` for location-only filtering. Impact uses the current graph; a full scan with a baseline is preferable when deleting calls or changing runtime registration.
+
+Repeated scans reuse unchanged raw module facts in `.pyrx/cache`, then rebuild cross-module links. `--no-cache` bypasses the cache; `-v` reports reuse. See [analysis behavior](docs/analysis.md) for workspace, framework, evidence, and coverage details.
+
 Inline suppressions use `# pyrx: ignore[check-name]` (or `# pyrex: ignore[check-name]`).
 
 ---
 
-### 3. `pyrx morph` — Multi-File CST Refactoring & Consolidation
+### 3. `pyrx morph` — Explicit Multi-File CST Codemods
 
 ```bash
-# Preview consolidating duplicate helpers into a canonical definition
-pyrx morph consolidate --project . --canonical my_pkg.utils.normalize_slug --dry-run
-
 # Apply declarative codemods conditioned on megascope facts (e.g. callerExecutionContext == "async")
 pyrx morph rewrite --project . --rules-json rules.json --dry-run
 ```
+
+Explicit codemods reject stale or incomplete source indexes and syntactically invalid output before writing. Rules are user-specified transformations; they do not prove semantic equivalence.
 
 ---
 

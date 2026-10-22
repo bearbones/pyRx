@@ -1,5 +1,3 @@
-use crate::check::CheckSeverity;
-use crate::check::sprawl::{check_semantic_clone, select_canonical_entity};
 use crate::graph::ProgramIndex;
 use crate::model::*;
 use crate::snapshot::write_file_atomically;
@@ -72,253 +70,6 @@ pub struct MorphRule {
     pub ensure_import: Option<String>,
 }
 
-/// Consolidates duplicate functions across the repository (`pyrex morph consolidate`).
-pub fn run_consolidate(
-    index: &ProgramIndex,
-    project_root: &Path,
-    canonical_filter: Option<&str>,
-    explicit_duplicates: &[String],
-    dry_run: bool,
-) -> Result<MorphReport, String> {
-    // 1. Identify `(canonical_entity, Vec<duplicate_entity>)` groups
-    let groups = build_consolidation_groups(index, canonical_filter, explicit_duplicates)?;
-    if groups.is_empty() {
-        return Ok(MorphReport {
-            dry_run,
-            files_changed: 0,
-            total_edits: 0,
-            changes: Vec::new(),
-        });
-    }
-
-    let mut edits_by_file: BTreeMap<String, Vec<TextEdit>> = BTreeMap::new();
-    let mut imports_to_add_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut deleted_entity_qnames: BTreeSet<String> = BTreeSet::new();
-    for (_, dups) in &groups {
-        for d in dups {
-            deleted_entity_qnames.insert(d.qualified_name.clone());
-        }
-    }
-
-    // Load source text for files we need to inspect/edit
-    let mut source_cache: BTreeMap<String, String> = BTreeMap::new();
-    let mut load_file = |rel_file: &str| -> Result<String, String> {
-        if let Some(s) = source_cache.get(rel_file) {
-            return Ok(s.clone());
-        }
-        let abs = project_root.join(rel_file);
-        let content = fs::read_to_string(&abs)
-            .map_err(|e| format!("Failed to read '{}': {e}", abs.display()))?;
-        source_cache.insert(rel_file.to_string(), content.clone());
-        Ok(content)
-    };
-
-    for (canonical, duplicates) in &groups {
-        let canon_import_stmt = format!("from {} import {}", canonical.module, canonical.name);
-
-        for dup in duplicates {
-            let dup_src = load_file(&dup.file)?;
-            let (del_start, del_end) = expand_function_deletion_span(&dup_src, dup);
-            edits_by_file
-                .entry(dup.file.clone())
-                .or_default()
-                .push(TextEdit {
-                    byte_start: del_start,
-                    byte_end: del_end,
-                    replacement: String::new(),
-                    description: format!(
-                        "Delete duplicate function '{}' (consolidated into '{}')",
-                        dup.qualified_name, canonical.qualified_name
-                    ),
-                });
-
-            // Rewrite any import statement across the repository that imports `dup`
-            for imp in &index.imports {
-                if imp.target_module == dup.module
-                    && imp.imported_symbol.as_deref() == Some(dup.name.as_str())
-                {
-                    let imp_src = load_file(&imp.file)?;
-                    let new_imp = if let Some(alias) = &imp.alias {
-                        format!(
-                            "from {} import {} as {}",
-                            canonical.module, canonical.name, alias
-                        )
-                    } else {
-                        format!("from {} import {}", canonical.module, canonical.name)
-                    };
-                    let start = imp.byte_start as usize;
-                    let end = (imp.byte_end as usize).min(imp_src.len());
-                    edits_by_file
-                        .entry(imp.file.clone())
-                        .or_default()
-                        .push(TextEdit {
-                            byte_start: start,
-                            byte_end: end,
-                            replacement: new_imp,
-                            description: format!(
-                                "Rewrite import of '{}' to canonical '{}'",
-                                dup.qualified_name, canonical.qualified_name
-                            ),
-                        });
-                }
-            }
-
-            // Rewrite all call sites of `dup.qualified_name` across the repository
-            for edge in index.effective_callers(&dup.qualified_name) {
-                // Skip call sites that live inside a function being deleted!
-                if deleted_entity_qnames.contains(&edge.caller) {
-                    continue;
-                }
-                let call_src = load_file(&edge.file)?;
-                if let Some((callee_start, callee_end, callee_text)) = find_call_callee_span(
-                    &call_src,
-                    edge.byte_start as usize,
-                    edge.byte_end as usize,
-                ) {
-                    // Check if the caller used an import alias (`from dup_mod import dup_fn as my_alias`)
-                    let used_alias = index.imports.iter().any(|imp| {
-                        imp.importer_module == edge.module
-                            && imp.target_module == dup.module
-                            && imp.imported_symbol.as_deref() == Some(dup.name.as_str())
-                            && imp.alias.as_deref() == Some(callee_text)
-                    });
-                    if !used_alias && callee_text != canonical.name {
-                        edits_by_file
-                            .entry(edge.file.clone())
-                            .or_default()
-                            .push(TextEdit {
-                                byte_start: callee_start,
-                                byte_end: callee_end,
-                                replacement: canonical.name.clone(),
-                                description: format!(
-                                    "Rewrite call '{}' -> '{}'",
-                                    callee_text, canonical.name
-                                ),
-                            });
-                    }
-                    // If the call was in `dup.file` itself or used `dup_mod.dup_fn(...)`, ensure canonical import is added
-                    if edge.file == dup.file || callee_text.contains('.') {
-                        if edge.file != canonical.file {
-                            imports_to_add_by_file
-                                .entry(edge.file.clone())
-                                .or_default()
-                                .insert(canon_import_stmt.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Convert `imports_to_add_by_file` into top-of-file insertion edits
-    for (file, stmts) in imports_to_add_by_file {
-        let src = load_file(&file)?;
-        let mut needed: Vec<String> = Vec::new();
-        for st in stmts {
-            if !src.contains(&st) {
-                needed.push(st);
-            }
-        }
-        if !needed.is_empty() {
-            let insert_offset = find_import_insertion_offset(&src);
-            let block = needed.join("\n") + "\n";
-            edits_by_file.entry(file).or_default().push(TextEdit {
-                byte_start: insert_offset,
-                byte_end: insert_offset,
-                replacement: block,
-                description: format!("Add canonical import(s): {}", needed.join("; ")),
-            });
-        }
-    }
-
-    apply_edits_and_build_report(&source_cache, edits_by_file, project_root, dry_run)
-}
-
-fn build_consolidation_groups<'a>(
-    index: &'a ProgramIndex,
-    canonical_filter: Option<&str>,
-    explicit_duplicates: &[String],
-) -> Result<Vec<(&'a EntityNode, Vec<&'a EntityNode>)>, String> {
-    if let Some(canon_query) = canonical_filter {
-        let canon_ent = find_entity_by_query(index, canon_query)
-            .ok_or_else(|| format!("Canonical symbol '{canon_query}' not found in index"))?;
-
-        let mut dups = Vec::new();
-        if !explicit_duplicates.is_empty() {
-            for dq in explicit_duplicates {
-                let d_ent = find_entity_by_query(index, dq)
-                    .ok_or_else(|| format!("Duplicate symbol '{dq}' not found in index"))?;
-                if d_ent.qualified_name != canon_ent.qualified_name {
-                    dups.push(d_ent);
-                }
-            }
-        } else {
-            // Find all functions with matching skeleton_hash or high similarity to `canon_ent`
-            for ent in &index.entities {
-                if ent.qualified_name == canon_ent.qualified_name {
-                    continue;
-                }
-                if matches!(ent.kind, EntityKind::Function | EntityKind::AsyncFunction)
-                    && ent.skeleton_hash != 0
-                    && ent.skeleton_hash == canon_ent.skeleton_hash
-                {
-                    dups.push(ent);
-                }
-            }
-        }
-        if dups.is_empty() {
-            return Ok(Vec::new());
-        }
-        return Ok(vec![(canon_ent, dups)]);
-    }
-
-    // Automatic discovery via `semantic-clone` exact skeleton hash clusters
-    let _ = check_semantic_clone(index, CheckSeverity::Warning);
-    let mut by_hash: BTreeMap<u64, Vec<&'a EntityNode>> = BTreeMap::new();
-    for ent in &index.entities {
-        if matches!(ent.kind, EntityKind::Function | EntityKind::AsyncFunction)
-            && ent.skeleton_hash != 0
-            && ent.statement_count >= 2
-            && !ent.name.starts_with("test_")
-            && !crate::workspace::is_test_path(&ent.file, &ent.module)
-        {
-            by_hash.entry(ent.skeleton_hash).or_default().push(ent);
-        }
-    }
-
-    let mut groups = Vec::new();
-    for cluster in by_hash.into_values() {
-        let distinct_mods: BTreeSet<&str> = cluster.iter().map(|e| e.module.as_str()).collect();
-        if cluster.len() < 2 || distinct_mods.len() < 2 {
-            continue;
-        }
-        let canonical = select_canonical_entity(&cluster, index);
-        let dups: Vec<&'a EntityNode> = cluster
-            .into_iter()
-            .filter(|e| e.qualified_name != canonical.qualified_name)
-            .collect();
-        if !dups.is_empty() {
-            groups.push((canonical, dups));
-        }
-    }
-    Ok(groups)
-}
-
-fn find_entity_by_query<'a>(index: &'a ProgramIndex, query: &str) -> Option<&'a EntityNode> {
-    if let Some(&idx) = index.entity_by_qname.get(query) {
-        return Some(&index.entities[idx]);
-    }
-    if let Some(&idx) = index.entity_by_usr.get(query) {
-        return Some(&index.entities[idx]);
-    }
-    if let Some(indices) = index.entities_by_short_name.get(query) {
-        if indices.len() == 1 {
-            return Some(&index.entities[indices[0]]);
-        }
-    }
-    None
-}
-
 /// Runs declarative cross-module codemod rules (`pyrex morph --rules-json <file>`) conditioned on `megascope` facts.
 pub fn run_declarative_rules(
     index: &ProgramIndex,
@@ -326,6 +77,7 @@ pub fn run_declarative_rules(
     rules: &[MorphRule],
     dry_run: bool,
 ) -> Result<MorphReport, String> {
+    crate::cache::verify_source_fingerprints(index, project_root)?;
     // Precompute the set of entities reachable from any `async def` coroutine
     let reachable_from_async = compute_entities_reachable_from_async(index);
 
@@ -340,6 +92,17 @@ pub fn run_declarative_rules(
         let abs = project_root.join(rel_file);
         let content = fs::read_to_string(&abs)
             .map_err(|e| format!("Failed to read '{}': {e}", abs.display()))?;
+        let expected = index
+            .meta
+            .modules
+            .iter()
+            .find(|module| module.file == rel_file)
+            .ok_or_else(|| format!("Source '{rel_file}' is not in the index"))?;
+        if xxhash_rust::xxh3::xxh3_64(content.as_bytes()) != expected.fingerprint {
+            return Err(format!(
+                "Stale index: '{rel_file}' changed while planning; no files were written"
+            ));
+        }
         source_cache.insert(rel_file.to_string(), content.clone());
         Ok(content)
     };
@@ -381,6 +144,12 @@ pub fn run_declarative_rules(
 
             match rule.action.as_str() {
                 "wrap_asyncio_to_thread" => {
+                    if edge.execution_context != ExecutionContext::Async {
+                        return Err(format!(
+                            "Rule '{}' would create an unawaited coroutine in synchronous function '{}'; offload at the async boundary instead",
+                            rule.id, edge.caller
+                        ));
+                    }
                     let Some((callee_s, args_s)) = split_call_callee_and_args(call_slice) else {
                         continue;
                     };
@@ -533,7 +302,7 @@ pub fn run_declarative_rules(
         let src = load_file(&file)?;
         let mut needed = Vec::new();
         for st in stmts {
-            if !src.contains(&st) {
+            if !has_top_level_import(&src, &st) {
                 needed.push(st);
             }
         }
@@ -583,22 +352,6 @@ fn compute_entities_reachable_from_async(index: &ProgramIndex) -> BTreeSet<Strin
     reachable
 }
 
-fn expand_function_deletion_span(source: &str, ent: &EntityNode) -> (usize, usize) {
-    let mut start = (ent.byte_start as usize).min(source.len());
-    let mut end = (ent.byte_end as usize).min(source.len());
-
-    // Include leading indentation on the first line of the function/decorator
-    while start > 0 && matches!(source.as_bytes()[start - 1], b' ' | b'\t') {
-        start -= 1;
-    }
-    // Include trailing newline(s) after the function body
-    let bytes = source.as_bytes();
-    while end < bytes.len() && (bytes[end] == b'\r' || bytes[end] == b'\n') {
-        end += 1;
-    }
-    (start, end)
-}
-
 fn find_call_callee_span(
     source: &str,
     call_start: usize,
@@ -626,12 +379,32 @@ fn split_call_callee_and_args(call_slice: &str) -> Option<(&str, &str)> {
     Some((callee, args))
 }
 
+fn has_top_level_import(source: &str, statement: &str) -> bool {
+    parse_module(source).is_ok_and(|parsed| {
+        parsed.syntax().body.iter().any(|stmt| {
+            matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_))
+                && source[stmt.range().start().to_usize()..stmt.range().end().to_usize()].trim()
+                    == statement
+        })
+    })
+}
+
 /// Finds the byte offset at the top of a Python module right after any shebang, encoding comment,
 /// module docstring, or `from __future__ import ...` statements.
 fn find_import_insertion_offset(source: &str) -> usize {
     if let Ok(parsed) = parse_module(source) {
         let module = parsed.into_syntax();
         let mut insert_after = 0usize;
+        for line in source.split_inclusive('\n').take(2) {
+            if line.starts_with("#!")
+                || (line.trim_start().starts_with('#')
+                    && (line.contains("coding:") || line.contains("coding=")))
+            {
+                insert_after += line.len();
+            } else {
+                break;
+            }
+        }
         for (idx, stmt) in module.body.iter().enumerate() {
             // Skip leading module docstring
             if idx == 0 {
@@ -733,6 +506,9 @@ fn apply_edits_and_build_report(
             continue;
         }
 
+        parse_module(&new_content).map_err(|error| {
+            format!("Rule produced invalid Python in '{file}': {error}; no files were written")
+        })?;
         let diff = TextDiff::from_lines(orig.as_str(), new_content.as_str())
             .unified_diff()
             .header(&format!("a/{file}"), &format!("b/{file}"))
@@ -750,6 +526,16 @@ fn apply_edits_and_build_report(
     }
 
     if !dry_run {
+        // Recheck the complete plan immediately before applying any file.
+        for (file, original) in source_cache {
+            let current = fs::read_to_string(project_root.join(file))
+                .map_err(|e| format!("Cannot recheck '{file}': {e}"))?;
+            if current != *original {
+                return Err(format!(
+                    "Source '{file}' changed while planning; no files were written"
+                ));
+            }
+        }
         for change in &changes {
             let abs = project_root.join(&change.file);
             write_file_atomically(&abs, change.new_content.as_bytes())?;

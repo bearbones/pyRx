@@ -10,11 +10,13 @@
   - `megascope::snapshot` — Deterministic `.pyrx` binary format (`PYRX\x00\x01\x00\x00` magic, `xxh3_64` section checksums, `memmap2` read, atomic write, and `merge_snapshots`).
   - `megascope::diff` — Semantic diff between `.pyrx` snapshots, unified diff parser, and reverse-BFS change impact analysis.
   - `megascope::query` — All 20 `megascope` query tools, identity disambiguation (`not_found` + `didYouMean`, `ambiguous` exit code 4), paging contract, and `json`/`ndjson`/`tsv` output formatting.
+- `src/cache.rs` — Content- and frontend-version-validated raw module cache; always relink after reuse.
+- `src/frameworks.rs` — Narrow, disableable pytest and Home Assistant entry-point adapters.
 - `src/workspace.rs` — Python workspace & module discovery (`pyproject.toml`, `.pyrx.toml`, `src/` layout, `__init__.py` packages, `SKILL.md` scripts, relative import resolution, `requires-python` inspection).
 - `src/indexer.rs` — Per-module Python AST & control-flow context indexer (`try`/`except`/`finally`, `with`/`async with`, conditional guards, exception raises, resource allocations, dict shapes, env accesses, Python 3.15 PEP 810 `lazy import`, and alpha-renaming AST/CFG skeleton canonicalizer) emitting `megascope::model::ModuleShard`.
 - `src/check/` — `pyrx check` engine, `pyrxFingerprint/v1` stable hashes, inline `# pyrx: ignore[...]` / `# pyrex: ignore[...]` suppressions, `.pyrx.toml` per-check severity & CI exit-code configurability (`fail_on`, `fail`), baselines, diff gating, SARIF 2.1.0 / JSON / text reporters, and all 16 checks across Categories A–E (`sprawl.rs`, `reachability.rs`, `exceptions.rs`, `async_conc.rs`, `imports.rs`).
 - `docs/checks/` — Detailed user-facing documentation for all 16 `pyRx` checks (`docs/checks/README.md` and `docs/checks/<check>.md`).
-- `src/morph/mod.rs` — Lossless byte-span CST rewriter (`consolidate` and declarative `--rules-json` codemods).
+- `src/morph/mod.rs` — Lossless byte-span CST rewriter (explicit declarative `--rules-json` codemods; no automatic consolidation).
 - `buck2/pyrex.bzl` & `buck2/pyrex.bxl` — 3-tier Buck2 map-reduce indexing (`PyrexIndexTSet`), check, and query rules plus zero-config BXL scripts.
 
 ## Build & Test Commands
@@ -40,3 +42,7 @@ Temporary development artifacts must stay temporary or go into **GitHub Issues**
 - **Keep `docs/` strictly for durable, user- or contributor-facing reference documentation** that describes the current system as built (e.g., `docs/checks/**`).
 - **Track planned work, follow-ups, design proposals, and open questions in GitHub Issues** (`gh issue create` / `gh issue edit`).
 - **Use untracked scratch directories** (`scratch/` or `/tmp/`) for temporary scripts, benchmark logs, and working notes during a session.
+
+## Analysis behavior
+
+Similarity diagnostics are informational and never authorize rewriting. All check traversals are cycle-safe without a depth cutoff; compact display uses three leading and three trailing frames, while JSON evidence and `-vv` preserve full paths. See `docs/analysis.md`. Run `cargo test --all-targets`, `cargo fmt --all -- --check`, and `cargo clippy --all-targets -- -D warnings` after changes.

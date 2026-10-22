@@ -1,5 +1,7 @@
 pub mod async_conc;
+pub mod evidence;
 pub mod exceptions;
+mod impact;
 pub mod imports;
 pub mod reachability;
 pub mod sprawl;
@@ -85,7 +87,7 @@ pub const ALL_CHECKS: &[CheckDescriptor] = &[
         name: "semantic-clone",
         category: "sprawl",
         default_enabled: true,
-        default_severity: CheckSeverity::Warning,
+        default_severity: CheckSeverity::Note,
         description: "Functions/methods across modules with identical or near-identical normalized AST/CFG skeletons",
     },
     CheckDescriptor {
@@ -255,6 +257,8 @@ pub struct PyrexCheckConfigFile {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedCheckConfig {
+    /// Opt in to legacy changed-line-only filtering. Default includes cross-module impact.
+    pub diff_lines_only: bool,
     pub enabled_checks: BTreeSet<String>,
     pub severities: BTreeMap<String, CheckSeverity>,
     pub fail_on: FailOnThreshold,
@@ -318,9 +322,10 @@ impl Default for ResolvedCheckConfig {
         );
         options.insert("semantic-clone.min_statements".to_string(), "5".to_string());
         Self {
+            diff_lines_only: false,
             enabled_checks: enabled,
             severities,
-            fail_on: FailOnThreshold::Note,
+            fail_on: FailOnThreshold::Warning,
             fail_overrides: BTreeMap::new(),
             options,
             entry_points: Vec::new(),
@@ -829,6 +834,8 @@ pub struct Finding {
     pub fingerprint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<evidence::EvidenceStep>,
 }
 
 impl Finding {
@@ -861,6 +868,7 @@ impl Finding {
             entities,
             fingerprint,
             canonical_target,
+            evidence: Vec::new(),
         }
     }
 }
@@ -909,11 +917,25 @@ pub struct BaselineFile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckRunReport {
+    pub analysis: AnalysisCoverage,
     pub summary: CheckSummary,
     pub modules: Vec<ModuleStatusRow>,
     pub findings: Vec<Finding>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stale_baseline: Vec<BaselineEntry>,
+}
+
+/// Coverage describes the indexed graph, not a proof about Python's dynamic runtime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisCoverage {
+    pub traversal: String,
+    pub call_edges: usize,
+    pub internal_call_edges: usize,
+    pub external_or_unresolved_call_edges: usize,
+    pub uncertain_call_edges: usize,
+    pub entry_points: usize,
+    pub limitation: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1126,10 +1148,11 @@ pub fn run_checks(
         after_baseline = unsuppressed;
     }
 
-    // 3. Filter changed lines (`--patch-file` / `--git-base`)
+    // 3. Filter affected findings (`--patch-file` / `--git-base`; explicit legacy lines mode)
     let mut outside_changes_count = None;
     let final_findings = if let Some(patch) = patch_text {
         let file_ranges = parse_unified_diff(patch);
+        let impact = impact::PatchImpact::new(index, &file_ranges);
         let mut out_cnt = 0usize;
         let mut kept = Vec::new();
         for f in after_baseline {
@@ -1139,7 +1162,16 @@ pub fn run_checks(
                         .iter()
                         .any(|&(s, e)| f.line >= s && f.line <= e.max(s))
             });
-            if in_patch {
+            let evidence_changed = f.evidence.iter().any(|step| {
+                file_ranges.get(&step.file).is_some_and(|ranges| {
+                    ranges
+                        .iter()
+                        .any(|&(start, end)| step.line >= start && step.line <= end.max(start))
+                })
+            });
+            if in_patch
+                || (!cfg.diff_lines_only && (evidence_changed || impact.contains(&f, index)))
+            {
                 kept.push(f);
             } else {
                 out_cnt += 1;
@@ -1184,6 +1216,15 @@ pub fn run_checks(
     };
 
     CheckRunReport {
+        analysis: AnalysisCoverage {
+            traversal: "cycle_safe_no_depth_limit".to_string(),
+            call_edges: index.calls.len(),
+            internal_call_edges: index.calls.iter().filter(|e| index.entity_by_qname.contains_key(&e.callee)).count(),
+            external_or_unresolved_call_edges: index.calls.iter().filter(|e| !index.entity_by_qname.contains_key(&e.callee)).count(),
+            uncertain_call_edges: index.calls.iter().filter(|e| e.confidence != EdgeConfidence::Proven).count(),
+            entry_points: index.entities.iter().filter(|e| e.is_entry_point).count(),
+            limitation: "Static graph only: unresolved dynamic calls, external implementations, and undiscovered framework entry points may hide behavior. Patch impact uses the current graph; use a full scan with a baseline to detect consequences of removed edges.".to_string(),
+        },
         summary: CheckSummary {
             modules: index.meta.modules.len(),
             analyzed,
@@ -1225,6 +1266,10 @@ pub fn build_baseline_file(findings: &[Finding]) -> BaselineFile {
 // ---------------------------------------------------------------------------
 
 pub fn render_text_report(report: &CheckRunReport) -> String {
+    render_text_report_verbose(report, 0)
+}
+
+pub fn render_text_report_verbose(report: &CheckRunReport, verbosity: u8) -> String {
     if report.findings.is_empty() && report.summary.failed == 0 {
         return "check: no issues found.\n".to_string();
     }
@@ -1237,8 +1282,32 @@ pub fn render_text_report(report: &CheckRunReport) -> String {
             f.column,
             f.severity.as_str(),
             f.check,
-            f.message
+            if verbosity >= 2 {
+                let full = f.full_path();
+                f.message
+                    .replace(&evidence::compact_path(&full), &full.join(" -> "))
+            } else {
+                f.message.clone()
+            }
         ));
+        if verbosity > 0 && !f.evidence.is_empty() {
+            let len = f.evidence.len();
+            for (i, step) in f.evidence.iter().enumerate() {
+                if verbosity < 2 && len > 6 && i >= 3 && i < len - 3 {
+                    if i == 3 {
+                        out.push_str(&format!(
+                            "  ... ({} call sites omitted; use -vv)\n",
+                            len - 6
+                        ));
+                    }
+                    continue;
+                }
+                out.push_str(&format!(
+                    "  {}:{}:{}: {} -> {} ({:?})\n",
+                    step.file, step.line, step.column, step.caller, step.callee, step.confidence
+                ));
+            }
+        }
     }
     out
 }
@@ -1279,7 +1348,7 @@ pub fn render_sarif_report(report: &CheckRunReport) -> String {
         .findings
         .iter()
         .map(|f| {
-            json!({
+            let mut result = json!({
                 "ruleId": f.check,
                 "level": f.severity.sarif_level(),
                 "message": {
@@ -1303,7 +1372,20 @@ pub fn render_sarif_report(report: &CheckRunReport) -> String {
                     "pyrxFingerprint/v1": f.fingerprint,
                     "pyrexFingerprint/v1": f.fingerprint,
                 }
-            })
+            });
+            if !f.evidence.is_empty() {
+                result["codeFlows"] = json!([{"threadFlows": [{"locations": f.evidence.iter().map(|step| json!({
+                    "location": {
+                        "message": {"text": format!("{} -> {}", step.caller, step.callee)},
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": step.file, "uriBaseId": "%SRCROOT%"},
+                            "region": {"startLine": step.line, "startColumn": step.column}
+                        }
+                    },
+                    "properties": {"confidence": step.confidence}
+                })).collect::<Vec<_>>()}]}]);
+            }
+            result
         })
         .collect();
 
@@ -1316,11 +1398,12 @@ pub fn render_sarif_report(report: &CheckRunReport) -> String {
                     "driver": {
                         "name": "pyRx",
                         "version": crate::VERSION,
-                        "informationUri": "https://github.com/pyRx/pyRx",
+                        "informationUri": "https://github.com/bearbones/pyRx",
                         "rules": rules,
                     }
                 },
                 "results": results,
+                "properties": {"analysis": report.analysis},
             }
         ]
     });

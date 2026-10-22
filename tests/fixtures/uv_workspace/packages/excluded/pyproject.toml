@@ -1,0 +1,5 @@
+[project]
+name = "excluded"
+version = "0.1.0"
+[project.scripts]
+excluded = "bad:main"

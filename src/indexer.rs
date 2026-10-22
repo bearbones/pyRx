@@ -1708,6 +1708,9 @@ impl<'a> ModuleAstIndexer<'a> {
 
                 self.record_call_site(call, &raw_callee, &resolved_callee);
 
+                // Await applies to this call, not to synchronous argument evaluation.
+                let enclosing_await_depth = self.await_depth;
+                self.await_depth = 0;
                 // Visit callee and arguments
                 self.visit_expr(&call.func);
                 for arg in &call.arguments.args {
@@ -1719,6 +1722,7 @@ impl<'a> ModuleAstIndexer<'a> {
                     self.check_higher_order_arg(&kw.value);
                 }
                 self.cast_context = prev_cast;
+                self.await_depth = enclosing_await_depth;
             }
             Expr::Await(aw) => {
                 // Check if awaiting while holding a threading.Lock
@@ -2023,9 +2027,17 @@ impl<'a> ModuleAstIndexer<'a> {
                     self.visit_expr(s);
                 }
             }
-            Expr::FString(_)
-            | Expr::TString(_)
-            | Expr::StringLiteral(_)
+            Expr::FString(string) => {
+                for element in string.value.elements() {
+                    self.visit_interpolation(element);
+                }
+            }
+            Expr::TString(string) => {
+                for element in string.value.elements() {
+                    self.visit_interpolation(element);
+                }
+            }
+            Expr::StringLiteral(_)
             | Expr::BytesLiteral(_)
             | Expr::NumberLiteral(_)
             | Expr::BooleanLiteral(_)
@@ -2033,6 +2045,17 @@ impl<'a> ModuleAstIndexer<'a> {
             | Expr::EllipsisLiteral(_)
             | Expr::Constant(_)
             | Expr::IpyEscapeCommand(_) => {}
+        }
+    }
+
+    fn visit_interpolation(&mut self, element: &ruff_python_ast::InterpolatedStringElement) {
+        if let ruff_python_ast::InterpolatedStringElement::Interpolation(interpolation) = element {
+            self.visit_expr(&interpolation.expression);
+            if let Some(spec) = &interpolation.format_spec {
+                for nested in &spec.elements {
+                    self.visit_interpolation(nested);
+                }
+            }
         }
     }
 
@@ -2817,8 +2840,6 @@ fn is_route_or_cli_decorator(dec: &str) -> bool {
         || lower.ends_with(".route")
         || lower.ends_with(".command")
         || lower.ends_with(".task")
-        || lower.ends_with(".fixture")
-        || lower == "fixture"
         || lower == "command"
 }
 

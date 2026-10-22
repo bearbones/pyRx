@@ -1,0 +1,5 @@
+[project]
+name = "sample-core"
+version = "0.1.0"
+[project.scripts]
+sample = "demo.api:main"

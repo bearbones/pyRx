@@ -28,71 +28,43 @@ fn non_blocking_replacement_hint(callee: &str, hazard_kind: &str) -> &'static st
 }
 
 pub fn check_blocking_in_async(index: &ProgramIndex, severity: CheckSeverity) -> Vec<Finding> {
+    use super::evidence::{call_path, compact_path, forward_path};
     let mut findings = Vec::new();
-
     for root in &index.entities {
         if !root.kind.is_async() && root.execution_context != ExecutionContext::Async {
             continue;
         }
-
-        let mut queue: VecDeque<(String, Vec<String>, Option<CallEdge>)> = VecDeque::new();
-        let mut visited = BTreeSet::new();
-        let mut reported_callees = BTreeSet::new();
-        visited.insert(root.qualified_name.clone());
-        queue.push_back((
-            root.qualified_name.clone(),
-            vec![root.qualified_name.clone()],
-            None,
-        ));
-
-        while let Some((cur, path, first_edge)) = queue.pop_front() {
-            if path.len() > 8 {
-                continue;
-            }
+        let mut queue = VecDeque::from([root.qualified_name.clone()]);
+        let mut visited = BTreeSet::from([root.qualified_name.clone()]);
+        let mut parents = BTreeMap::new();
+        let mut reported = BTreeSet::new();
+        while let Some(cur) = queue.pop_front() {
             for edge in index.effective_callees(&cur) {
                 if edge.kind == CallEdgeKind::HigherOrderCallback {
                     continue;
                 }
-                let mut next_path = path.clone();
-                next_path.push(edge.callee.clone());
-                let root_edge = first_edge.clone().unwrap_or_else(|| edge.clone());
-
-                if let Some(hazard_kind) = is_blocking_callee(&edge.callee) {
-                    if reported_callees.insert(edge.callee.clone()) {
-                        let hops = next_path.len() - 1;
-                        let replacement = non_blocking_replacement_hint(&edge.callee, hazard_kind);
+                if let Some(hazard) = is_blocking_callee(&edge.callee) {
+                    if reported.insert(edge.callee.clone()) {
+                        let mut path = forward_path(&parents, &cur);
+                        path.push(edge.clone());
+                        let first = &path[0];
                         findings.push(Finding::new(
-                            "blocking-in-async",
-                            hazard_kind,
-                            severity,
-                            &root_edge.file,
-                            root_edge.line,
-                            root_edge.column,
-                            &root.qualified_name,
-                            vec![root.qualified_name.clone(), edge.callee.clone()],
-                            format!(
-                                "Async coroutine '{}' transitively calls blocking '{}' ({} hop(s): {}); {}",
-                                root.qualified_name,
-                                edge.callee,
-                                hops,
-                                next_path.join(" -> "),
-                                replacement
-                            ),
-                            None,
-                        ));
+                            "blocking-in-async", hazard, severity, &first.file, first.line, first.column,
+                            &root.qualified_name, vec![root.qualified_name.clone(), edge.callee.clone()],
+                            format!("Async coroutine '{}' transitively calls blocking '{}' ({} hop(s): {}); {}",
+                                root.qualified_name, edge.callee, path.len(), compact_path(&call_path(&path)),
+                                non_blocking_replacement_hint(&edge.callee, hazard)), None,
+                        ).with_evidence(&path));
                     }
-                    continue;
-                }
-
-                if index.entity_by_qname.contains_key(&edge.callee)
+                } else if index.entity_by_qname.contains_key(&edge.callee)
                     && visited.insert(edge.callee.clone())
                 {
-                    queue.push_back((edge.callee, next_path, Some(root_edge)));
+                    queue.push_back(edge.callee.clone());
+                    parents.insert(edge.callee.clone(), edge);
                 }
             }
         }
     }
-
     findings
 }
 
@@ -133,11 +105,11 @@ pub fn check_lock_order_inversion(index: &ProgramIndex, severity: CheckSeverity)
         ));
     }
 
-    // 2. Compute transitive lock acquisitions for every entity (up to 6 hops)
+    // 2. Compute transitive lock acquisitions for every entity with cycle-safe traversal
     let mut transitive_locks: BTreeMap<String, Vec<(String, String, u32)>> = BTreeMap::new();
     for ent in &index.entities {
         if ent.kind.is_callable() {
-            let locks = collect_transitive_locks(&ent.qualified_name, index, 6);
+            let locks = collect_transitive_locks(&ent.qualified_name, index);
             if !locks.is_empty() {
                 transitive_locks.insert(ent.qualified_name.clone(), locks);
             }
@@ -236,11 +208,7 @@ pub fn check_lock_order_inversion(index: &ProgramIndex, severity: CheckSeverity)
     findings
 }
 
-fn collect_transitive_locks(
-    start_qname: &str,
-    index: &ProgramIndex,
-    max_depth: usize,
-) -> Vec<(String, String, u32)> {
+fn collect_transitive_locks(start_qname: &str, index: &ProgramIndex) -> Vec<(String, String, u32)> {
     let mut out = Vec::new();
     let mut seen_locks = BTreeSet::new();
     let mut queue = VecDeque::new();
@@ -256,10 +224,10 @@ fn collect_transitive_locks(
                 }
             }
         }
-        if depth >= max_depth {
-            continue;
-        }
         for edge in index.effective_callees(&cur) {
+            if edge.kind == CallEdgeKind::HigherOrderCallback {
+                continue;
+            }
             if index.entity_by_qname.contains_key(&edge.callee)
                 && visited.insert(edge.callee.clone())
             {
