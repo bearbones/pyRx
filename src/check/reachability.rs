@@ -36,8 +36,8 @@ pub fn collect_public_interface_entry_points(
         }
     }
 
-    // Follow multi-hop re-exports across modules (up to 4 hops)
-    for _ in 0..4 {
+    // Follow multi-hop re-exports across modules to a fixed point
+    loop {
         let current: Vec<(String, String)> = init_reexports.iter().cloned().collect();
         let mut added = false;
         for (tmod, tsym) in current {
@@ -154,7 +154,7 @@ pub fn check_dead_code_with_entry_points(
         let dead_callers: Vec<String> = callers.into_iter().map(|c| c.caller).collect();
         let msg = if dead_callers.is_empty() {
             format!(
-                "{:?} '{}' is unreachable from any entry point in the repository (if part of the public interface, export via '__all__', re-export in package '__init__.py', or add to '[entry_points]' in '.pyrx.toml'; symbols only called by unit tests are reported under 'test-only-production-code')",
+                "{:?} '{}' is not reachable from the indexed entry points (if part of the public interface, export via '__all__', re-export in package '__init__.py', or add to '[entry_points]' in '.pyrx.toml'; symbols only called by unit tests are reported under 'test-only-production-code')",
                 ent.kind, ent.qualified_name
             )
         } else {
@@ -467,7 +467,7 @@ pub fn check_test_only_production_code_with_entry_points(
                 &ent.qualified_name,
                 vec![ent.qualified_name.clone()],
                 format!(
-                    "Production {:?} '{}' in '{}' is only called from test code ({}); if part of the public interface, export via '__all__', re-export in '__init__.py', or add to '[entry_points]' in '.pyrx.toml'",
+                    "Production {:?} '{}' in '{}' has only test callers in the indexed graph ({}); if part of the public interface, export via '__all__', re-export in '__init__.py', or add to '[entry_points]' in '.pyrx.toml'",
                     ent.kind,
                     ent.qualified_name,
                     ent.file,

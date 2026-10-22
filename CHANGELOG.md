@@ -2,6 +2,17 @@
 
 All notable changes to `pyRx` (`pyrx`) will be documented in this file.
 
+## Unreleased
+
+- Remove automatic function consolidation; report semantic similarity as informational notes. The default failure threshold is now `warning`.
+- Index f-string and t-string expressions and nested format specs; resolve uv workspace member globs, exclusions, member scripts, and specific package roots.
+- Traverse check call/import graphs without hidden depth limits, with compact three-leading/three-trailing paths and full JSON/SARIF evidence or `-vv` text.
+- Include affected callers/importers in patch gating; retain explicit `--diff-scope lines` mode.
+- Cache raw module facts by content, frontend identity, and entry-point configuration, then relink the graph; support `--no-cache`.
+- Recognize pytest fixture and Home Assistant framework entry points with an opt-out.
+- Reject stale/incomplete indexes and invalid Python output for explicit codemods.
+- Add an executable acceptance corpus and a reproducible static depth profiler.
+
 ## [0.1.0] - 2026-10-19
 
 ### Added

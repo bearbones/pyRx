@@ -1,4 +1,6 @@
+pub mod cache;
 pub mod check;
+mod frameworks;
 pub mod indexer;
 pub mod morph;
 pub mod workspace;
@@ -8,7 +10,6 @@ pub use megascope::{diff, ffi, graph, model, query, snapshot};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use crate::graph::ProgramIndex;
-use crate::indexer::index_module;
 use crate::model::ModuleShard;
 use crate::workspace::{SourceSelectionOptions, select_sources};
 use rayon::prelude::*;
@@ -19,29 +20,37 @@ pub fn bake_program_index(
     collapse_paths: Vec<String>,
     threads: usize,
 ) -> Result<ProgramIndex, String> {
+    bake_program_index_with_stats(sel_opts, collapse_paths, threads).map(|(index, _)| index)
+}
+
+pub fn bake_program_index_with_stats(
+    sel_opts: &SourceSelectionOptions,
+    collapse_paths: Vec<String>,
+    threads: usize,
+) -> Result<(ProgramIndex, cache::CacheStats), String> {
     let (ws, modules) = select_sources(sel_opts)?;
     if modules.is_empty() {
         return Err("No Python source files matched selection".to_string());
     }
 
+    let cache = cache::ModuleCache::new(&ws, !sel_opts.no_cache);
     let mut shards: Vec<ModuleShard> = if threads == 1 || modules.len() == 1 {
-        modules.iter().map(|m| index_module(m, &ws)).collect()
+        modules.iter().map(|m| cache.index(m, &ws)).collect()
     } else {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .map_err(|e| format!("Failed to initialize thread pool: {e}"))?;
-        pool.install(|| modules.par_iter().map(|m| index_module(m, &ws)).collect())
+        pool.install(|| modules.par_iter().map(|m| cache.index(m, &ws)).collect())
     };
 
+    frameworks::mark_entry_points(&mut shards, &ws);
     propagate_package_exports(&mut shards);
 
     let project_root_str = ws.project_root.to_string_lossy().replace('\\', "/");
-    Ok(ProgramIndex::from_shards(
-        shards,
-        project_root_str,
-        ws.entry_points,
-        collapse_paths,
+    Ok((
+        ProgramIndex::from_shards(shards, project_root_str, ws.entry_points, collapse_paths),
+        cache.stats(),
     ))
 }
 
@@ -84,8 +93,8 @@ pub fn propagate_package_exports(shards: &mut [ModuleShard]) {
         }
     }
 
-    // Follow multi-hop re-export chains (up to 4 hops, e.g. pkg/__init__.py -> pkg/sub/__init__.py -> pkg/sub/mod.py)
-    for _ in 0..4 {
+    // Follow multi-hop re-export chains (e.g. pkg/__init__.py -> pkg/sub/__init__.py -> pkg/sub/mod.py)
+    loop {
         let current: Vec<(String, String)> = exported_targets.iter().cloned().collect();
         let mut added = false;
         for (tmod, tsym) in current {

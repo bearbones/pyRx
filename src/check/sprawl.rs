@@ -88,7 +88,7 @@ pub fn check_semantic_clone_with_options(
                 &ent.qualified_name,
                 vec![canonical.qualified_name.clone(), ent.qualified_name.clone()],
                 format!(
-                    "Function '{}' has an identical normalized AST/CFG skeleton to '{}' ({}:{}); consolidate into canonical helper '{}'",
+                    "Function '{}' has an identical normalized AST/CFG skeleton to '{}' ({}:{}); review whether sharing an implementation with '{}' would be appropriate (similarity does not imply equivalent behavior)",
                     ent.qualified_name,
                     canonical.qualified_name,
                     canonical.file,
@@ -141,7 +141,7 @@ pub fn check_semantic_clone_with_options(
                         &dup.qualified_name,
                         vec![canonical.qualified_name.clone(), dup.qualified_name.clone()],
                         format!(
-                            "Function '{}' is a near-duplicate AST/CFG clone ({:.0}% similarity) of '{}' ({}:{}); consider consolidating into '{}'",
+                            "Function '{}' is a near-duplicate AST/CFG clone ({:.0}% similarity) of '{}' ({}:{}); review whether sharing an implementation with '{}' would be appropriate (similarity does not imply equivalent behavior)",
                             dup.qualified_name,
                             sim * 100.0,
                             canonical.qualified_name,

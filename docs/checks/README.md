@@ -8,7 +8,7 @@
 
 | Check | Default | Severity | Summary |
 | :--- | :---: | :---: | :--- |
-| [`semantic-clone`](semantic-clone.md) | `on` | `warning` | Duplicate or near-duplicate functions/methods across modules with identical alpha-renamed AST/CFG skeletons. |
+| [`semantic-clone`](semantic-clone.md) | `on` | `note` | Duplicate or near-duplicate functions/methods across modules with identical alpha-renamed AST/CFG skeletons. |
 | [`schema-drift`](schema-drift.md) | `on` | `warning` | Parallel `@dataclass`, `TypedDict`, `NamedTuple`, or Pydantic `BaseModel` schemas across modules with overlapping or conflicting field types. |
 | [`dict-contract-mismatch`](dict-contract-mismatch.md) | `on` | `error` | Producer dict literal keys disagree with consumer subscript accesses (`d["k"]`) across module boundaries. |
 | [`uncentralized-env-access`](uncentralized-env-access.md) | `on` | `warning` | Scattered `os.environ` / `os.getenv` reads outside configuration modules, or conflicting defaults/casts across files *(legacy alias: `env-sprawl`)*. |
@@ -108,3 +108,7 @@ os.getenv("LEGACY_FLAG")  # pyrx: ignore[uncentralized-env-access]
 ```
 
 Both `# pyrx: ignore[...]` and `# pyrex: ignore[...]` are supported, as well as legacy check aliases (`env-sprawl` and `unused-parameter-cross-tu`).
+
+## Evidence, limits, and incremental analysis
+
+See [analysis behavior](../analysis.md) for compact versus complete paths, current-graph patch impact, cache invalidation, framework entry points, and static-analysis limitations. Notes are informational under the default `fail_on = "warning"` threshold.

@@ -1,3 +1,4 @@
+use crate::check::evidence::{call_path, compact_path};
 use crate::check::{CheckSeverity, Finding};
 use crate::graph::ProgramIndex;
 use crate::model::*;
@@ -38,7 +39,10 @@ pub fn check_import_side_effects(index: &ProgramIndex, severity: CheckSeverity) 
 
         for &e_idx in top_edge_indices {
             let top_edge = &index.calls[e_idx];
-            if top_edge.kind == CallEdgeKind::Decorator {
+            if matches!(
+                top_edge.kind,
+                CallEdgeKind::Decorator | CallEdgeKind::HigherOrderCallback
+            ) {
                 continue;
             }
             if let Some(ctx) = index.contexts.get(top_edge.context_id as usize) {
@@ -53,12 +57,12 @@ pub fn check_import_side_effects(index: &ProgramIndex, severity: CheckSeverity) 
 
             // Check if `top_edge.callee` directly or transitively executes an impure import-time side effect
             if let Some((effect_kind, effect_callee, chain)) =
-                find_transitive_side_effect(top_edge, index, 5)
+                find_transitive_side_effect(top_edge, index)
             {
                 let path_str = if chain.len() <= 1 {
                     effect_callee.clone()
                 } else {
-                    chain.join(" -> ")
+                    compact_path(&call_path(&chain))
                 };
                 findings.push(Finding::new(
                     "import-side-effects",
@@ -74,7 +78,7 @@ pub fn check_import_side_effects(index: &ProgramIndex, severity: CheckSeverity) 
                         mod_ent.module, effect_kind, effect_callee, path_str
                     ),
                     None,
-                ));
+                ).with_evidence(&chain));
             }
         }
     }
@@ -85,28 +89,20 @@ pub fn check_import_side_effects(index: &ProgramIndex, severity: CheckSeverity) 
 fn find_transitive_side_effect(
     top_edge: &CallEdge,
     index: &ProgramIndex,
-    max_depth: usize,
-) -> Option<(&'static str, String, Vec<String>)> {
+) -> Option<(&'static str, String, Vec<CallEdge>)> {
     if let Some(kind) = classify_side_effect_call(&top_edge.callee, &top_edge.arg_constants) {
-        return Some((
-            kind,
-            top_edge.callee.clone(),
-            vec![top_edge.caller.clone(), top_edge.callee.clone()],
-        ));
+        return Some((kind, top_edge.callee.clone(), vec![top_edge.clone()]));
     }
 
     if !index.entity_by_qname.contains_key(&top_edge.callee) {
         return None;
     }
 
-    let mut queue: VecDeque<(String, Vec<String>)> = VecDeque::new();
+    let mut queue: VecDeque<(String, Vec<CallEdge>)> = VecDeque::new();
     let mut visited = BTreeSet::new();
     visited.insert(top_edge.caller.clone());
     visited.insert(top_edge.callee.clone());
-    queue.push_back((
-        top_edge.callee.clone(),
-        vec![top_edge.caller.clone(), top_edge.callee.clone()],
-    ));
+    queue.push_back((top_edge.callee.clone(), vec![top_edge.clone()]));
 
     while let Some((cur, path)) = queue.pop_front() {
         // Check if `cur` mutates os.environ
@@ -118,12 +114,12 @@ fn find_transitive_side_effect(
             return Some(("env_mutation", cur, path));
         }
 
-        if path.len() > max_depth + 1 {
-            continue;
-        }
         for edge in index.effective_callees(&cur) {
+            if edge.kind == CallEdgeKind::HigherOrderCallback {
+                continue;
+            }
             let mut next_path = path.clone();
-            next_path.push(edge.callee.clone());
+            next_path.push(edge.clone());
             if let Some(kind) = classify_side_effect_call(&edge.callee, &edge.arg_constants) {
                 return Some((kind, edge.callee, next_path));
             }
@@ -253,10 +249,10 @@ pub fn check_import_cycle(index: &ProgramIndex, severity: CheckSeverity) -> Vec<
                 format!(
                     "Runtime top-level import cycle across {} modules: {} (guard type-only imports with 'if TYPE_CHECKING:' or move inside functions)",
                     scc.len(),
-                    cycle_chain.join(" -> ")
+                    compact_path(&cycle_chain)
                 ),
                 None,
-            ));
+            ).with_import_path(index, &cycle_chain));
         }
     }
 
@@ -454,16 +450,16 @@ pub fn check_heavy_import_leak(
                                 "Module '{}' transitively imports heavyweight package '{}' at module load time (chain: {}); {}",
                                 root_mod,
                                 heavy_pkg,
-                                next_chain.join(" -> "),
+                                compact_path(&next_chain),
                                 lazy_guidance
                             ),
                             None,
-                        ));
+                        ).with_import_path(index, &next_chain));
                     }
                     continue;
                 }
 
-                if next_chain.len() <= 12 && visited.insert(imp.target_module.clone()) {
+                if visited.insert(imp.target_module.clone()) {
                     queue.push_back((imp.target_module.clone(), next_chain, Some(root_imp)));
                 }
             }

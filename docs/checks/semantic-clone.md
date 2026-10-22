@@ -2,7 +2,7 @@
 
 - **Category**: `sprawl` (Category A — Anti-Sprawl & LLM Consolidation)
 - **Default**: Enabled (`on`)
-- **Default Severity**: `warning`
+- **Default Severity**: `note` (informational; does not fail the default check run)
 
 ## What It Detects
 
@@ -18,23 +18,23 @@ def clean_slug(raw_text: str) -> str:
     cleaned = raw_text.strip().lower()
     if not cleaned:
         raise ValueError("empty")
-    return cleaned.replace(" ", "-")
+    slug = cleaned.replace(" ", "-")
+    return slug
 
 # pkg/beta.py
 def normalize_slug(value: str) -> str:
     s = value.strip().lower()
     if not s:
         raise ValueError("empty")
-    return s.replace(" ", "-")
+    result = s.replace(" ", "-")
+    return result
 ```
 
-## How to Fix
+## How to Interpret
 
-Consolidate the duplicate implementations into a single shared helper module and import it at each call site—or run `pyrx morph consolidate`:
+This is a review suggestion, not a correctness warning or a proof of equivalence. Normalization erases literal values and parameter names, so two functions can match while implementing different behavior. Review literals, defaults, decorators, captured state, keyword arguments, and external callers before sharing an implementation.
 
-```bash
-pyrx morph consolidate --project . --canonical pkg.alpha.clean_slug --dry-run
-```
+The diagnostic does not generate a fix. Automatic consolidation is deliberately unsupported. Keep separate functions when that better expresses the domain or allows them to evolve independently.
 
 ## Per-Check Options
 
@@ -47,8 +47,7 @@ pyrx morph consolidate --project . --canonical pkg.alpha.clean_slug --dry-run
 ```toml
 # .pyrx.toml
 [rules.semantic-clone]
-severity = "warning"
-fail = true
+severity = "note"
 min_statements = 5
 ```
 
